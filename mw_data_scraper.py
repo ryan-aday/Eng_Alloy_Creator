@@ -57,6 +57,7 @@ from tqdm import tqdm
 # Constants & patterns
 # ------------------------
 ROOT = "https://web.archive.org/web/20250915014250/https://www.makeitfrom.com/"
+ORIGINAL_ROOT = "https://www.makeitfrom.com/"
 ARCHIVE_RE = re.compile(r"^(https?://web\.archive\.org/web/[^/]+/)(.*)$", re.IGNORECASE)
 
 ARTICLE_PAT = re.compile(r"-[dt]_\d+\.html$", re.IGNORECASE)
@@ -122,6 +123,9 @@ def join_url(base: str, href: str) -> Optional[str]:
         return None
     if href.startswith("//"):
         href = "https:" + href
+    if href.startswith("/web/"):
+        # Already an archive path; join directly against archive host to avoid double-wrapping.
+        href = urllib.parse.urljoin("https://web.archive.org", href)
 
     archive_prefix, base_original = _split_archive_url(base)
 
@@ -141,11 +145,15 @@ def join_url(base: str, href: str) -> Optional[str]:
     return canonicalize_url(target)
 
 def is_article_like(url: str) -> bool:
+    _, original = _split_archive_url(url)
+    if not original.startswith(ORIGINAL_ROOT):
+        return False
+
     if EXCLUDE_PAT.search(url):
         return False
     if ARTICLE_PAT.search(url):
         return True
-    if url.startswith(ROOT) and HTML_PAT.search(url):
+    if HTML_PAT.search(original):
         return True
     return False
 
@@ -153,7 +161,7 @@ def read_robots_txt(ignore: bool, ua: str) -> Optional[robotparser.RobotFilePars
     if ignore:
         return None
     rp = robotparser.RobotFileParser()
-    robots_url = ROOT + "robots.txt"
+    robots_url = urllib.parse.urljoin(ORIGINAL_ROOT, "robots.txt")
     rp.set_url(robots_url)
     try:
         rp.read()

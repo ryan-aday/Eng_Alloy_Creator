@@ -58,6 +58,7 @@ from tqdm import tqdm
 # ------------------------
 ROOT = "https://web.archive.org/web/20250915014250/https://www.makeitfrom.com/"
 ORIGINAL_ROOT = "https://www.makeitfrom.com/"
+ARCHIVE_HOST = "https://web.archive.org"
 ARCHIVE_RE = re.compile(r"^(https?://web\.archive\.org/web/[^/]+/)(.*)$", re.IGNORECASE)
 
 ARTICLE_PAT = re.compile(r"-[dt]_\d+\.html$", re.IGNORECASE)
@@ -115,6 +116,11 @@ def _wrap_archive(original_url: str, archive_prefix: Optional[str]) -> str:
         return f"{archive_prefix}{original_url}"
     return original_url
 
+def is_makeitfrom_url(url: str) -> bool:
+    """Return True if the URL points to the MakeItFrom domain (archived or live)."""
+    _, original = _split_archive_url(url)
+    return original.startswith(ORIGINAL_ROOT)
+
 def join_url(base: str, href: str) -> Optional[str]:
     if not href:
         return None
@@ -125,7 +131,7 @@ def join_url(base: str, href: str) -> Optional[str]:
         href = "https:" + href
     if href.startswith("/web/"):
         # Already an archive path; join directly against archive host to avoid double-wrapping.
-        href = urllib.parse.urljoin("https://web.archive.org", href)
+        href = urllib.parse.urljoin(ARCHIVE_HOST, href)
 
     archive_prefix, base_original = _split_archive_url(base)
 
@@ -173,7 +179,8 @@ def allowed_by_robots(rp: Optional[robotparser.RobotFileParser], ua: str, url: s
     if rp is None:
         return True
     try:
-        return rp.can_fetch(ua, url)
+        _, original = _split_archive_url(url)
+        return rp.can_fetch(ua, original)
     except Exception:
         return True
 
@@ -513,10 +520,10 @@ def main():
         with open(state_path, "r", encoding="utf-8") as f:
             state = json.load(f)
         todo = state.get("todo", [])
-        seen = set(state.get("seen", []))
+        seen_original = set(state.get("seen_original", state.get("seen", [])))
     else:
         todo = [canonicalize_url(u) for u in args.seeds]
-        seen = set()
+        seen_original = set()
 
     # Optional: seed from previous corpus
     if args.from_corpus and os.path.exists(args.from_corpus):
@@ -530,8 +537,15 @@ def main():
                 seed_urls.append(rec.get("url", ""))
                 seed_urls.extend(rec.get("outlinks", []))
         for u in sorted(set(seed_urls)):
-            if u and u.startswith(ROOT) and is_article_like(u) and u not in seen:
-                todo.append(u)
+            if not u:
+                continue
+            if not is_makeitfrom_url(u) or not is_article_like(u):
+                continue
+            _, u_original = _split_archive_url(u)
+            u_original_canon = canonicalize_url(u_original)
+            if u_original_canon in seen_original:
+                continue
+            todo.append(u)
 
     rp = read_robots_txt(args.ignore_robots, ua=ua)
 
@@ -542,11 +556,14 @@ def main():
     try:
         while todo:
             url = todo.pop(0)
-            if url in seen:
-                continue
-            seen.add(url)
+            _, original_url = _split_archive_url(url)
+            original_canon = canonicalize_url(original_url)
 
-            if not url.startswith(ROOT):
+            if original_canon in seen_original:
+                continue
+            seen_original.add(original_canon)
+
+            if not is_makeitfrom_url(url):
                 continue
 
             # Follow HTML pages; keep category pages to expand links
@@ -604,13 +621,14 @@ def main():
                 target = join_url(url, a["href"])
                 if not target:
                     continue
-                if not target.startswith(ROOT):
+                if not is_makeitfrom_url(target):
                     continue
+                _, t_original = _split_archive_url(target)
+                t_original_canon = canonicalize_url(t_original)
                 if EXCLUDE_PAT.search(target):
                     continue
-                if target not in seen:
-                    if is_article_like(target):
-                        todo.append(target)
+                if t_original_canon not in seen_original and is_article_like(target):
+                    todo.append(target)
                 outlinks.append(target)
 
             rec = PageRecord(
@@ -641,7 +659,7 @@ def main():
             # Persist state periodically
             if pages_crawled % 25 == 0:
                 with open(state_path, "w", encoding="utf-8") as sf:
-                    json.dump({"todo": todo, "seen": list(seen)}, sf, ensure_ascii=False, indent=2)
+                    json.dump({"todo": todo, "seen_original": list(seen_original)}, sf, ensure_ascii=False, indent=2)
 
             if args.max_pages and pages_crawled >= args.max_pages:
                 break
@@ -649,7 +667,7 @@ def main():
     finally:
         out_f.close()
         with open(state_path, "w", encoding="utf-8") as sf:
-            json.dump({"todo": todo, "seen": list(seen)}, sf, ensure_ascii=False, indent=2)
+            json.dump({"todo": todo, "seen_original": list(seen_original)}, sf, ensure_ascii=False, indent=2)
         pbar.close()
 
     # Chunking pass (optional)

@@ -24,6 +24,7 @@ from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
+from tqdm import tqdm
 
 DEFAULT_UA = "ArchiveLinkCollector/1.0 (+contact: your_email@example.com)"
 
@@ -135,31 +136,41 @@ def crawl_links(start: str, out_path: str, delay: float, user_agent: str, same_d
 
     maybe_enqueue(start)
 
-    while queue:
-        current = queue.popleft()
-        in_queue.discard(current)
-        if current in fetched:
-            continue
-        fetched.add(current)
-
-        try:
-            resp = session.get(current, allow_redirects=True, timeout=30)
-            resp.raise_for_status()
-        except Exception:
-            continue
-
-        final_url = canonicalize(resp.url)
-        maybe_enqueue(final_url)
-        soup = BeautifulSoup(resp.text, "lxml")
-
-        for a in soup.find_all("a", href=True):
-            nxt = normalize_href(final_url, a["href"])
-            if not nxt:
+    pbar = tqdm(total=0, unit="url", dynamic_ncols=True)
+    try:
+        while queue:
+            current = queue.popleft()
+            in_queue.discard(current)
+            if current in fetched:
                 continue
-            maybe_enqueue(nxt)
+            fetched.add(current)
+            pbar.update(1)
 
-        if delay > 0:
-            time.sleep(delay)
+            pbar.set_description(
+                f"Fetched={len(fetched)} queued={len(queue)} discovered={len(best_snapshots) + len(plain_links)}"
+            )
+            pbar.refresh()
+
+            try:
+                resp = session.get(current, allow_redirects=True, timeout=30)
+                resp.raise_for_status()
+            except Exception:
+                continue
+
+            final_url = canonicalize(resp.url)
+            maybe_enqueue(final_url)
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            for a in soup.find_all("a", href=True):
+                nxt = normalize_href(final_url, a["href"])
+                if not nxt:
+                    continue
+                maybe_enqueue(nxt)
+
+            if delay > 0:
+                time.sleep(delay)
+    finally:
+        pbar.close()
 
     # Build final list keeping only the most recent snapshot per origin.
     final_links = [snap for _, snap in best_snapshots.values()]

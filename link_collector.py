@@ -16,6 +16,7 @@ python link_collector.py --start https://web.archive.org/web/20250915014250/http
 """
 
 import argparse
+import contextlib
 import json
 import time
 import urllib.parse
@@ -88,26 +89,47 @@ def normalize_href(base_url: str, href: str) -> Optional[str]:
     return canonicalize(href)
 
 
-def crawl_links(start: str, out_path: str, delay: float, user_agent: str, same_domain: bool = True) -> None:
-    session = requests.Session()
-    session.headers.update({"User-Agent": user_agent})
-
+def crawl_links(
+    start: str,
+    out_path: str,
+    delay: float,
+    user_agent: str,
+    same_domain: bool = True,
+    workers: int = 8,
+) -> None:
     start_netloc = urllib.parse.urlsplit(start).netloc
     wb_info = parse_wayback(start)
     if wb_info:
         _, orig_url = wb_info
         start_netloc = urllib.parse.urlsplit(orig_url).netloc
 
-    queue = deque()
+    queue: deque[str] = deque()
     in_queue = set()
     fetched = set()
     best_snapshots = {}
     plain_links = set()
 
+    try:
+        import threading
+    except Exception:
+        threading = None  # type: ignore
+
+    lock = threading.Lock() if threading else contextlib.nullcontext()
+
+    def synchronized(fn):
+        if lock is None:
+            return fn
+
+        def wrapper(*args, **kwargs):
+            with lock:
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    @synchronized
     def maybe_enqueue(url: str) -> None:
         nonlocal start_netloc
         parsed = urllib.parse.urlsplit(url)
-        # Domain guard
         if same_domain:
             wb = parse_wayback(url)
             candidate_netloc = urllib.parse.urlsplit(wb[1]).netloc if wb else parsed.netloc
@@ -137,19 +159,30 @@ def crawl_links(start: str, out_path: str, delay: float, user_agent: str, same_d
     maybe_enqueue(start)
 
     pbar = tqdm(total=0, unit="url", dynamic_ncols=True)
-    try:
-        while queue:
-            current = queue.popleft()
-            in_queue.discard(current)
-            if current in fetched:
-                continue
-            fetched.add(current)
-            pbar.update(1)
 
+    def session_factory():
+        s = requests.Session()
+        s.headers.update({"User-Agent": user_agent})
+        return s
+
+    def worker_loop():
+        session = session_factory()
+        while True:
+            with lock:
+                if not queue:
+                    return
+                current = queue.popleft()
+                in_queue.discard(current)
+                if current in fetched:
+                    continue
+                fetched.add(current)
+                queued_now = len(queue)
+                discovered_now = len(best_snapshots) + len(plain_links)
+
+            pbar.update(1)
             pbar.set_description(
-                f"Fetched={len(fetched)} queued={len(queue)} discovered={len(best_snapshots) + len(plain_links)}"
+                f"Fetched={len(fetched)} queued={queued_now} discovered={discovered_now}"
             )
-            pbar.refresh()
 
             try:
                 resp = session.get(current, allow_redirects=True, timeout=30)
@@ -169,10 +202,20 @@ def crawl_links(start: str, out_path: str, delay: float, user_agent: str, same_d
 
             if delay > 0:
                 time.sleep(delay)
-    finally:
-        pbar.close()
 
-    # Build final list keeping only the most recent snapshot per origin.
+    if threading:
+        threads = []
+        for _ in range(max(1, workers)):
+            t = threading.Thread(target=worker_loop, daemon=True)
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join()
+    else:
+        worker_loop()
+    pbar.close()
+
     final_links = [snap for _, snap in best_snapshots.values()]
     final_links.extend(sorted(plain_links))
 
@@ -191,6 +234,12 @@ def main():
         action="store_true",
         help="If set, follow links to any domain instead of staying on the START domain.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Number of concurrent worker threads to fetch links (default: 8).",
+    )
     args = parser.parse_args()
 
     crawl_links(
@@ -199,6 +248,7 @@ def main():
         delay=args.delay,
         user_agent=args.user_agent,
         same_domain=not args.all_domains,
+        workers=max(1, args.workers),
     )
 
 

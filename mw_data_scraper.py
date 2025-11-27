@@ -48,7 +48,6 @@ from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 from urllib import robotparser
 
-import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
@@ -56,10 +55,16 @@ from tqdm import tqdm
 # ------------------------
 # Constants & patterns
 # ------------------------
-ROOT = "https://web.archive.org/web/20250915014250/https://www.makeitfrom.com/"
+START = "https://web.archive.org/web/20250915014250/https://www.makeitfrom.com/"
 ORIGINAL_ROOT = "https://www.makeitfrom.com/"
 ARCHIVE_HOST = "https://web.archive.org"
 ARCHIVE_RE = re.compile(r"^(https?://web\.archive\.org/web/[^/]+/)(.*)$", re.IGNORECASE)
+# Some archived pages emit URLs that already include a nested `/web/<ts>/...` path inside the
+# MakeItFrom domain (e.g., https://www.makeitfrom.com/web/<ts>/https://www.makeitfrom.com/...).
+NESTED_ARCHIVE_IN_ORIGINAL = re.compile(
+    r"^(https?://www\.makeitfrom\.com)/web/\d+/(https?://www\.makeitfrom\.com/.*)$",
+    re.IGNORECASE,
+)
 
 ARTICLE_PAT = re.compile(r"-[dt]_\d+\.html$", re.IGNORECASE)
 HTML_PAT = re.compile(r"\.html?$", re.IGNORECASE)
@@ -116,10 +121,19 @@ def _wrap_archive(original_url: str, archive_prefix: Optional[str]) -> str:
         return f"{archive_prefix}{original_url}"
     return original_url
 
+def _normalize_original(original_url: str) -> str:
+    """Strip nested Wayback paths accidentally embedded inside the original URL."""
+
+    m = NESTED_ARCHIVE_IN_ORIGINAL.match(original_url)
+    if m:
+        return canonicalize_url(m.group(2))
+    return canonicalize_url(original_url)
+
 def is_makeitfrom_url(url: str) -> bool:
     """Return True if the URL points to the MakeItFrom domain (archived or live)."""
     _, original = _split_archive_url(url)
-    return original.startswith(ORIGINAL_ROOT)
+    normalized_original = _normalize_original(original)
+    return normalized_original.startswith(ORIGINAL_ROOT)
 
 def join_url(base: str, href: str) -> Optional[str]:
     if not href:
@@ -139,12 +153,12 @@ def join_url(base: str, href: str) -> Optional[str]:
         href_archive_prefix, href_original = _split_archive_url(href)
         if href_archive_prefix:
             archive_prefix = href_archive_prefix
-            target_original = canonicalize_url(href_original)
+            target_original = _normalize_original(href_original)
         else:
-            target_original = canonicalize_url(href)
+            target_original = _normalize_original(href)
     else:
         # Join relative URLs against the original (non-archive) location, then wrap back.
-        target_original = canonicalize_url(urllib.parse.urljoin(base_original, href))
+        target_original = _normalize_original(urllib.parse.urljoin(base_original, href))
 
     # Preserve archive prefix if we started from an archived page.
     target = _wrap_archive(target_original, archive_prefix)
@@ -152,7 +166,8 @@ def join_url(base: str, href: str) -> Optional[str]:
 
 def is_article_like(url: str) -> bool:
     _, original = _split_archive_url(url)
-    if not original.startswith(ORIGINAL_ROOT):
+    normalized_original = _normalize_original(original)
+    if not normalized_original.startswith(ORIGINAL_ROOT):
         return False
 
     if EXCLUDE_PAT.search(url):
@@ -180,7 +195,7 @@ def allowed_by_robots(rp: Optional[robotparser.RobotFileParser], ua: str, url: s
         return True
     try:
         _, original = _split_archive_url(url)
-        return rp.can_fetch(ua, original)
+        return rp.can_fetch(ua, _normalize_original(original))
     except Exception:
         return True
 
@@ -275,12 +290,20 @@ def extract_text_blocks(soup: BeautifulSoup) -> List[str]:
         prev = b
     return deduped
 
-def extract_tables(url: str, html_text: str) -> List[pd.DataFrame]:
-    try:
-        dfs = pd.read_html(html_text)
-        return dfs
-    except Exception:
-        return []
+def extract_tables(url: str, soup: BeautifulSoup) -> List[List[List[str]]]:
+    tables = []
+    for table in soup.find_all("table"):
+        rows = []
+        for tr in table.find_all("tr"):
+            cells = []
+            for cell in tr.find_all(["td", "th"]):
+                txt = _flatten_math_tags(cell).strip()
+                cells.append(txt)
+            if cells:
+                rows.append(cells)
+        if rows:
+            tables.append(rows)
+    return tables
 
 def extract_images(base_url: str, soup: BeautifulSoup) -> List[Dict]:
     out = []
@@ -469,10 +492,12 @@ def main():
 
     # Crawl scope
     parser.add_argument(
-        "--seeds", nargs="*", default=[
-            ROOT,
-        ],
-        help="Seed URLs to start crawling from (space-separated)."
+        "--start", default=START,
+        help="Archive start URL (timestamped Wayback link for MakeItFrom)."
+    )
+    parser.add_argument(
+        "--seeds", nargs="*", default=[],
+        help="Optional additional seed URLs (space-separated)."
     )
     parser.add_argument(
         "--from-corpus",
@@ -522,7 +547,8 @@ def main():
         todo = state.get("todo", [])
         seen_original = set(state.get("seen_original", state.get("seen", [])))
     else:
-        todo = [canonicalize_url(u) for u in args.seeds]
+        all_seeds = [args.start] + list(args.seeds)
+        todo = [canonicalize_url(u) for u in all_seeds if u]
         seen_original = set()
 
     # Optional: seed from previous corpus
@@ -542,7 +568,7 @@ def main():
             if not is_makeitfrom_url(u) or not is_article_like(u):
                 continue
             _, u_original = _split_archive_url(u)
-            u_original_canon = canonicalize_url(u_original)
+            u_original_canon = _normalize_original(u_original)
             if u_original_canon in seen_original:
                 continue
             todo.append(u)
@@ -556,12 +582,11 @@ def main():
     try:
         while todo:
             url = todo.pop(0)
-            _, original_url = _split_archive_url(url)
-            original_canon = canonicalize_url(original_url)
+            _, queued_original = _split_archive_url(url)
+            queued_original_canon = _normalize_original(queued_original)
 
-            if original_canon in seen_original:
+            if queued_original_canon in seen_original:
                 continue
-            seen_original.add(original_canon)
 
             if not is_makeitfrom_url(url):
                 continue
@@ -574,6 +599,14 @@ def main():
             if r is None:
                 continue
 
+            resolved_url = canonicalize_url(r.url)
+            _, resolved_original = _split_archive_url(resolved_url)
+            resolved_original_canon = _normalize_original(resolved_original)
+
+            if resolved_original_canon in seen_original:
+                continue
+            seen_original.add(resolved_original_canon)
+
             last_mod = r.headers.get("Last-Modified")
             etag = r.headers.get("ETag")
 
@@ -583,24 +616,30 @@ def main():
             title = extract_title(soup)
             citation = extract_citation_text(soup)
             text_blocks = extract_text_blocks(soup)
-            images = extract_images(url, soup)
-            tables = extract_tables(url, html_text)
+            images = extract_images(resolved_url, soup)
+            tables = extract_tables(resolved_url, soup)
             math_extracted = extract_equations_and_symbols(soup)
             equations = math_extracted["equations"]
             symbols = math_extracted["symbols"]
 
             # Save tables to CSV
             table_meta = []
-            for i, df in enumerate(tables):
-                base = f"{safe_filename(title) or 'page'}_{hashlib.sha1((url+str(i)).encode()).hexdigest()[:10]}.csv"
+            for i, rows in enumerate(tables):
+                if not rows:
+                    continue
+                n_rows = len(rows)
+                n_cols = max((len(r) for r in rows), default=0)
+                base = f"{safe_filename(title) or 'page'}_{hashlib.sha1((resolved_url+str(i)).encode()).hexdigest()[:10]}.csv"
                 csv_path = os.path.join(tables_dir, base)
                 try:
-                    df.to_csv(csv_path, index=False, quoting=csv.QUOTE_MINIMAL)
+                    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+                        writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+                        writer.writerows(rows)
                     table_meta.append({
                         "csv_path": os.path.relpath(csv_path, out_root),
-                        "n_rows": int(df.shape[0]),
-                        "n_cols": int(df.shape[1]),
-                        "caption": ""
+                        "n_rows": int(n_rows),
+                        "n_cols": int(n_cols),
+                        "caption": "",
                     })
                 except Exception:
                     continue
@@ -618,13 +657,13 @@ def main():
             # Outlinks discovery
             outlinks = []
             for a in soup.find_all("a", href=True):
-                target = join_url(url, a["href"])
+                target = join_url(resolved_url, a["href"])
                 if not target:
                     continue
                 if not is_makeitfrom_url(target):
                     continue
                 _, t_original = _split_archive_url(target)
-                t_original_canon = canonicalize_url(t_original)
+                t_original_canon = _normalize_original(t_original)
                 if EXCLUDE_PAT.search(target):
                     continue
                 if t_original_canon not in seen_original and is_article_like(target):
@@ -632,7 +671,7 @@ def main():
                 outlinks.append(target)
 
             rec = PageRecord(
-                url=url,
+                url=resolved_url,
                 title=title,
                 crawl_ts=now_iso(),
                 citation_text=citation,

@@ -20,7 +20,7 @@ import contextlib
 import json
 import time
 import urllib.parse
-from collections import deque
+from queue import Empty, Queue
 from typing import Optional
 
 import requests
@@ -103,7 +103,7 @@ def crawl_links(
         _, orig_url = wb_info
         start_netloc = urllib.parse.urlsplit(orig_url).netloc
 
-    queue: deque[str] = deque()
+    queue: Queue[str] = Queue()
     in_queue = set()
     fetched = set()
     best_snapshots = {}
@@ -144,7 +144,7 @@ def crawl_links(
                 return
             best_snapshots[orig_url] = (ts_val, canonicalize(url))
             if url not in fetched and url not in in_queue:
-                queue.append(url)
+                queue.put(url)
                 in_queue.add(url)
             return
 
@@ -153,12 +153,13 @@ def crawl_links(
             return
         plain_links.add(canon)
         if canon not in fetched and canon not in in_queue:
-            queue.append(canon)
+            queue.put(canon)
             in_queue.add(canon)
 
     maybe_enqueue(start)
 
     pbar = tqdm(total=0, unit="url", dynamic_ncols=True)
+    stop_event = threading.Event() if threading else None
 
     def session_factory():
         s = requests.Session()
@@ -168,15 +169,26 @@ def crawl_links(
     def worker_loop():
         session = session_factory()
         while True:
-            with lock:
-                if not queue:
+            try:
+                current = queue.get(timeout=1.0)
+            except Empty:
+                if stop_event is None:
                     return
-                current = queue.popleft()
+                if stop_event.is_set():
+                    return
+                continue
+
+            if current is None:
+                queue.task_done()
+                return
+
+            with lock:
                 in_queue.discard(current)
                 if current in fetched:
+                    queue.task_done()
                     continue
                 fetched.add(current)
-                queued_now = len(queue)
+                queued_now = queue.qsize()
                 discovered_now = len(best_snapshots) + len(plain_links)
 
             pbar.update(1)
@@ -188,6 +200,7 @@ def crawl_links(
                 resp = session.get(current, allow_redirects=True, timeout=30)
                 resp.raise_for_status()
             except Exception:
+                queue.task_done()
                 continue
 
             final_url = canonicalize(resp.url)
@@ -200,6 +213,8 @@ def crawl_links(
                     continue
                 maybe_enqueue(nxt)
 
+            queue.task_done()
+
             if delay > 0:
                 time.sleep(delay)
 
@@ -210,10 +225,17 @@ def crawl_links(
             threads.append(t)
             t.start()
 
+        # Wait for the queue to drain, then signal threads to stop and join them.
+        queue.join()
+        if stop_event:
+            stop_event.set()
+        for _ in threads:
+            queue.put(None)
         for t in threads:
             t.join()
     else:
-        worker_loop()
+        while not queue.empty():
+            worker_loop()
     pbar.close()
 
     final_links = [snap for _, snap in best_snapshots.values()]

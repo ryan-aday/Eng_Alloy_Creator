@@ -55,7 +55,7 @@ from tqdm import tqdm
 # ------------------------
 # Constants & patterns
 # ------------------------
-START = "https://www.makeitfrom.com/"
+START = "https://web.archive.org/web/20250915014250/https://www.makeitfrom.com/"
 ORIGINAL_ROOT = "https://www.makeitfrom.com/"
 ARCHIVE_HOST = "https://web.archive.org"
 ARCHIVE_RE = re.compile(r"^(https?://web\.archive\.org/web/[^/]+/)(.*)$", re.IGNORECASE)

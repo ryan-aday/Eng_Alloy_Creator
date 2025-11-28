@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Engineering ToolBox Crawler & Ingestor (RAG-ready)
+MakeItFrom Crawler & Ingestor (RAG-ready)
 
-- Discovers & crawls ET article/category pages
-- Extracts: title, cleaned text blocks, "This page can be cited as ..." citation,
-  tables (to CSV), images (downloaded), equations, "Where:" symbols, outlinks
+- Recursively discovers & crawls MakeItFrom article/category pages
+- Extracts: title, cleaned text blocks, citation text, tables (to CSV), images,
+  equations, "Where:" symbols, and outlinks
 - Outputs:
     out/
       corpus.jsonl              # one record per page
@@ -13,31 +13,29 @@ Engineering ToolBox Crawler & Ingestor (RAG-ready)
       img/                      # downloaded images
       tables/                   # CSVs from HTML tables
       crawl_state.json          # resume state
-- No global UA scoping issues: user agent is passed explicitly
 
 USAGE EXAMPLES
 --------------
 # Minimal crawl (default seeds), polite delay:
-python et_data_scraper.py --out ./et_corpus
+python mif_data_scraper.py --out ./mif_corpus
 
 # Resume later:
-python et_data_scraper.py --out ./et_corpus --resume
+python mif_data_scraper.py --out ./mif_corpus --resume
 
 # Faster (only if you have permission), chunk for RAG:
-python et_data_scraper.py --out ./et_corpus --delay 0.25 --chunk
+python mif_data_scraper.py --out ./mif_corpus --delay 0.25 --chunk
 
 # Limit page count for testing:
-python et_data_scraper.py --out ./et_corpus --max-pages 100
+python mif_data_scraper.py --out ./mif_corpus --max-pages 100
 
 # Re-seed using URLs/outlinks from a prior run's corpus:
-python et_data_scraper.py --out ./et_corpus_v2 --from-corpus ./et_corpus/corpus.jsonl --chunk
+python mif_data_scraper.py --out ./mif_corpus_v2 --from-corpus ./mif_corpus/corpus.jsonl --chunk
 """
 
 import argparse
 import csv
 import hashlib
 import html
-import io
 import json
 import os
 import re
@@ -46,7 +44,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 from urllib import robotparser
 
 import pandas as pd
@@ -58,20 +56,30 @@ from tqdm import tqdm
 # Constants & patterns
 # ------------------------
 ROOT = "https://www.makeitfrom.com"
-
 ARTICLE_PAT = re.compile(r"-[dt]_\d+\.html$", re.IGNORECASE)
 HTML_PAT = re.compile(r"\.html?$", re.IGNORECASE)
 EXCLUDE_PAT = re.compile(r"\.(pdf|zip|rar|7z|exe|docx?)$", re.IGNORECASE)
-
-DEFAULT_UA = "ET-RAG-Crawler/1.1 (+contact: your_email@example.com)"
+DEFAULT_UA = "MIF-RAG-Crawler/1.0 (+contact: your_email@example.com)"
 
 # Greek & sub/superscript normalization
 SUB_MAP = str.maketrans("0123456789+-=()n", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₙ")
 SUP_MAP = str.maketrans("0123456789+-=()n", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿ")
 GREEK = {
-    "&alpha;": "α", "&beta;": "β", "&gamma;": "γ", "&delta;": "δ", "&epsilon;": "ε",
-    "&theta;": "θ", "&lambda;": "λ", "&mu;": "μ", "&nu;": "ν", "&pi;": "π", "&rho;": "ρ",
-    "&sigma;": "σ", "&tau;": "τ", "&phi;": "φ", "&omega;": "ω",
+    "&alpha;": "α",
+    "&beta;": "β",
+    "&gamma;": "γ",
+    "&delta;": "δ",
+    "&epsilon;": "ε",
+    "&theta;": "θ",
+    "&lambda;": "λ",
+    "&mu;": "μ",
+    "&nu;": "ν",
+    "&pi;": "π",
+    "&rho;": "ρ",
+    "&sigma;": "σ",
+    "&tau;": "τ",
+    "&phi;": "φ",
+    "&omega;": "ω",
 }
 
 # Equation & symbol patterns
@@ -90,37 +98,51 @@ SYM_LINE = re.compile(
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def safe_filename(s: str, maxlen: int = 220) -> str:
-    s = re.sub(r"[^a-zA-Z0-9._-]+", "_", s).strip("_")
-    return s[:maxlen]
+def _normalize_path(path: str) -> str:
+    if path and path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+    return path or "/"
 
 def canonicalize_url(url: str) -> str:
     u = urllib.parse.urlsplit(url)
-    u = u._replace(fragment="")
+    u = u._replace(fragment="", path=_normalize_path(u.path))
     return urllib.parse.urlunsplit(u)
+
+def safe_filename(s: str, maxlen: int = 220) -> str:
+    s = re.sub(r"[^a-zA-Z0-9._-]+", "_", s).strip("_")
+    return s[:maxlen]
 
 def join_url(base: str, href: str) -> Optional[str]:
     if not href:
         return None
     href = href.strip()
+    if href.startswith("#"):
+        return None
     if href.startswith("//"):
         href = "https:" + href
     elif href.startswith("/"):
         href = urllib.parse.urljoin(ROOT, href)
-    elif href.startswith("#"):
-        return None
     elif not href.startswith("http"):
         href = urllib.parse.urljoin(base, href)
     return canonicalize_url(href)
 
-def is_article_like(url: str) -> bool:
+def in_domain(url: str) -> bool:
+    try:
+        host = urllib.parse.urlsplit(url).netloc.lower()
+    except Exception:
+        return False
+    return host.endswith("makeitfrom.com")
+
+def should_follow(url: str) -> bool:
+    if not in_domain(url):
+        return False
     if EXCLUDE_PAT.search(url):
         return False
-    if ARTICLE_PAT.search(url):
+    # Follow pages without extensions or typical HTML endings
+    if HTML_PAT.search(url):
         return True
-    if url.startswith(ROOT) and HTML_PAT.search(url):
-        return True
-    return False
+    path = urllib.parse.urlsplit(url).path
+    return not os.path.splitext(path)[1]
 
 def read_robots_txt(ignore: bool, ua: str) -> Optional[robotparser.RobotFileParser]:
     if ignore:
@@ -142,7 +164,6 @@ def allowed_by_robots(rp: Optional[robotparser.RobotFileParser], ua: str, url: s
         return True
 
 def fetch(url: str, ua: str, timeout: float = 30.0, retries: int = 3, backoff: float = 1.5) -> Optional[requests.Response]:
-    last_exc = None
     for i in range(retries):
         try:
             r = requests.get(url, headers={"User-Agent": ua}, timeout=timeout)
@@ -152,8 +173,7 @@ def fetch(url: str, ua: str, timeout: float = 30.0, retries: int = 3, backoff: f
                 time.sleep(backoff ** (i + 1))
             else:
                 return None
-        except Exception as e:
-            last_exc = e
+        except Exception:
             time.sleep(backoff ** (i + 1))
     return None
 
@@ -209,18 +229,18 @@ def extract_citation_text(soup: BeautifulSoup) -> str:
 
 def extract_text_blocks(soup: BeautifulSoup) -> List[str]:
     """Collect headings, paragraphs, list items, and prose-like TD/TH/DIV content."""
-    for tag in soup(["script","style","noscript","header","footer","nav","form","iframe"]):
+    for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "form", "iframe"]):
         tag.decompose()
 
     blocks = []
     root = soup.body or soup
-    for el in root.find_all(["h1","h2","h3","p","li","pre","code","td","th","div"]):
-        if el.find_parent(["nav","header","footer","form"]):
+    for el in root.find_all(["h1", "h2", "h3", "p", "li", "pre", "code", "td", "th", "div"]):
+        if el.find_parent(["nav", "header", "footer", "form"]):
             continue
         txt = _flatten_math_tags(el).strip()
         if not txt:
             continue
-        if el.name in ("td","th","div") and len(txt) < 12 and "=" not in txt:
+        if el.name in ("td", "th", "div") and len(txt) < 12 and "=" not in txt:
             continue
         blocks.append(txt)
 
@@ -232,7 +252,7 @@ def extract_text_blocks(soup: BeautifulSoup) -> List[str]:
         prev = b
     return deduped
 
-def extract_tables(url: str, html_text: str) -> List[pd.DataFrame]:
+def extract_tables(html_text: str) -> List[pd.DataFrame]:
     try:
         dfs = pd.read_html(html_text)
         return dfs
@@ -253,15 +273,10 @@ def extract_images(base_url: str, soup: BeautifulSoup) -> List[Dict]:
     return out
 
 def extract_equations_and_symbols(soup: BeautifulSoup) -> Dict[str, list]:
-    """
-    Returns:
-        {"equations": [str], "symbols": [{"symbol": str, "meaning": str}], "raw_blocks":[str]}
-    Scans paragraphs, table cells, list items, and code/pre.
-    """
     equations, symbol_pairs, raw_blocks = [], [], []
     candidates = soup.select("p, li, td, th, pre, code, div")
     for el in candidates:
-        if el.find_parent(["nav","header","footer","form","script","style"]):
+        if el.find_parent(["nav", "header", "footer", "form", "script", "style"]):
             continue
 
         txt = _flatten_math_tags(el)
@@ -269,11 +284,10 @@ def extract_equations_and_symbols(soup: BeautifulSoup) -> Dict[str, list]:
             continue
         raw_blocks.append(txt)
 
-        # WHERE header → parse next siblings and list items
         for line in txt.splitlines():
             if WHERE_HEAD.match(line.strip()):
                 sibs = []
-                ul = el.find_next_sibling(["ul","ol"])
+                ul = el.find_next_sibling(["ul", "ol"])
                 if ul:
                     for li in ul.select("li"):
                         s = _flatten_math_tags(li).strip()
@@ -281,7 +295,7 @@ def extract_equations_and_symbols(soup: BeautifulSoup) -> Dict[str, list]:
                             sibs.append(s)
                 nxt = el.find_next_siblings(limit=6)
                 for n in nxt:
-                    if n.name in ("p","li","div","td","th"):
+                    if n.name in ("p", "li", "div", "td", "th"):
                         s = _flatten_math_tags(n).strip()
                         if s:
                             sibs.append(s)
@@ -290,7 +304,6 @@ def extract_equations_and_symbols(soup: BeautifulSoup) -> Dict[str, list]:
                     if m:
                         symbol_pairs.append({"symbol": m.group(1), "meaning": m.group(2)})
 
-        # Equations from lines and whole blocks
         for line in txt.splitlines():
             line = line.strip()
             if not line:
@@ -305,17 +318,20 @@ def extract_equations_and_symbols(soup: BeautifulSoup) -> Dict[str, list]:
                 eq = m2.group(1).rstrip(" .;,")
                 equations.append(eq)
 
-    # Deduplicate while preserving order
-    seen = set(); equations_unique = []
+    seen = set()
+    equations_unique = []
     for e in equations:
         if e not in seen:
-            equations_unique.append(e); seen.add(e)
+            equations_unique.append(e)
+            seen.add(e)
 
-    seen_s = set(); sym_unique = []
+    seen_s = set()
+    sym_unique = []
     for d in symbol_pairs:
         k = d["symbol"]
         if k not in seen_s:
-            sym_unique.append(d); seen_s.add(k)
+            sym_unique.append(d)
+            seen_s.add(k)
 
     return {"equations": equations_unique, "symbols": sym_unique, "raw_blocks": raw_blocks}
 
@@ -346,13 +362,13 @@ class PageRecord:
     crawl_ts: str
     citation_text: str
     text_blocks: List[str]
-    tables: List[Dict]            # [{"csv_path":..., "n_rows":..., "n_cols":..., "caption": ""}]
-    images: List[Dict]            # [{"src":..., "alt":"", "local_path": "..."}]
+    tables: List[Dict]
+    images: List[Dict]
     outlinks: List[str]
     http_last_modified: Optional[str] = None
     http_etag: Optional[str] = None
-    equations: List[str] = None   # <-- NEW
-    symbols: List[Dict] = None    # <-- NEW
+    equations: List[str] = None
+    symbols: List[Dict] = None
 
 # ------------------------
 # Chunking
@@ -366,7 +382,8 @@ def chunk_blocks(blocks: List[str], max_words: int = 600, overlap: int = 120) ->
         words = b.split()
         wl = len(words)
         if cur_len + wl <= max_words:
-            cur.append(b); cur_len += wl
+            cur.append(b)
+            cur_len += wl
         else:
             if cur:
                 chunks.append("\n\n".join(cur))
@@ -375,7 +392,8 @@ def chunk_blocks(blocks: List[str], max_words: int = 600, overlap: int = 120) ->
                 cur = [tail_words, b]
                 cur_len = len(tail_words.split()) + wl
             else:
-                cur = [b]; cur_len = wl
+                cur = [b]
+                cur_len = wl
     if cur:
         chunks.append("\n\n".join(cur))
     return chunks
@@ -384,85 +402,43 @@ def chunk_blocks(blocks: List[str], max_words: int = 600, overlap: int = 120) ->
 # Main
 # ------------------------
 def main():
-    """
-    Engineering ToolBox full-site crawler & ingestor (RAG-ready)
-    """
+    """MakeItFrom full-site crawler & ingestor (RAG-ready)"""
     parser = argparse.ArgumentParser(
-        prog="et_data_scraper.py",
+        prog="mif_data_scraper.py",
         formatter_class=argparse.RawTextHelpFormatter,
         description=(
-            "Crawls EngineeringToolBox.com and saves pages, text, tables, images, equations, and symbol lists\n"
+            "Crawls MakeItFrom.com and saves pages, text, tables, images, equations, and symbol lists\n"
             "for use in Retrieval-Augmented Generation (RAG) pipelines.\n\n"
             "Typical workflow:\n"
-            "  1) Crawl ET pages -> corpus.jsonl (and optionally corpus_chunks.jsonl)\n"
+            "  1) Crawl MakeItFrom pages -> corpus.jsonl (and optionally corpus_chunks.jsonl)\n"
             "  2) Embed corpus_chunks.jsonl into a vector DB (Chroma, LanceDB, Milvus, etc.)\n"
             "  3) Use metadata (url, title, citation_text) to return precise citations in your app."
         ),
     )
 
-    # Required
-    parser.add_argument(
-        "--out", required=True,
-        help="Root output directory (JSONL + images + tables). Example: --out ./et_corpus"
-    )
-
-    # General crawling controls
-    parser.add_argument(
-        "--delay", type=float, default=0.8,
-        help="Delay between HTTP requests in seconds (default: 0.8)."
-    )
-    parser.add_argument(
-        "--max-pages", type=int, default=0,
-        help="Maximum pages to crawl (0 = no limit)."
-    )
-    parser.add_argument(
-        "--ignore-robots", action="store_true",
-        help="Ignore robots.txt (ONLY if you have explicit permission)."
-    )
-    parser.add_argument(
-        "--resume", action="store_true",
-        help="Resume from previous crawl_state.json if it exists."
-    )
-
-    # Crawl scope
-    parser.add_argument(
-        "--seeds", nargs="*", default=[
-            ROOT,
-        ],
-        help="Seed URLs to start crawling from (space-separated)."
-    )
-    parser.add_argument(
-        "--from-corpus",
-        help="Optional path to an existing corpus.jsonl; seeds crawl queue from saved urls/outlinks."
-    )
-
-    # Storage locations
+    parser.add_argument("--out", required=True, help="Root output directory (JSONL + images + tables). Example: --out ./mif_corpus")
+    parser.add_argument("--delay", type=float, default=0.8, help="Delay between HTTP requests in seconds (default: 0.8).")
+    parser.add_argument("--max-pages", type=int, default=0, help="Maximum pages to crawl (0 = no limit).")
+    parser.add_argument("--ignore-robots", action="store_true", help="Ignore robots.txt (ONLY if you have explicit permission).")
+    parser.add_argument("--resume", action="store_true", help="Resume from previous crawl_state.json if it exists.")
+    parser.add_argument("--seeds", nargs="*", default=[ROOT], help="Seed URLs to start crawling from (space-separated).")
+    parser.add_argument("--from-corpus", help="Optional path to an existing corpus.jsonl; seeds crawl queue from saved urls/outlinks.")
     parser.add_argument("--img", default="img", help="Subdirectory for downloaded images (default: img).")
     parser.add_argument("--tables", default="tables", help="Subdirectory for CSV tables (default: tables).")
     parser.add_argument("--user-agent", default=DEFAULT_UA, help="Custom HTTP User-Agent.")
+    parser.add_argument("--chunk", action="store_true", help="Also write a RAG-ready 'corpus_chunks.jsonl' with text segments.")
+    parser.add_argument("--chunk-max", type=int, default=600, help="Approximate words per chunk (default: 600).")
+    parser.add_argument("--chunk-overlap", type=int, default=120, help="Approximate word overlap between chunks (default: 120).")
 
-    # RAG options
-    parser.add_argument("--chunk", action="store_true",
-                        help="Also write a RAG-ready 'corpus_chunks.jsonl' with text segments.")
-    parser.add_argument("--chunk-max", type=int, default=600,
-                        help="Approximate words per chunk (default: 600).")
-    parser.add_argument("--chunk-overlap", type=int, default=120,
-                        help="Approximate word overlap between chunks (default: 120).")
-
-    # Print help if no args
     if len(sys.argv) == 1:
         parser.print_help(sys.stderr)
         sys.exit(0)
 
     args = parser.parse_args()
-
     ua = args.user_agent
 
-    # Prepare output dirs/files
     out_root = args.out
     os.makedirs(out_root, exist_ok=True)
-    pages_dir = os.path.join(out_root, "pages")
-    os.makedirs(pages_dir, exist_ok=True)
     img_dir = os.path.join(out_root, args.img)
     os.makedirs(img_dir, exist_ok=True)
     tables_dir = os.path.join(out_root, args.tables)
@@ -472,7 +448,6 @@ def main():
     chunks_jsonl = os.path.join(out_root, "corpus_chunks.jsonl")
     state_path = os.path.join(out_root, "crawl_state.json")
 
-    # Load / init state
     if args.resume and os.path.exists(state_path):
         with open(state_path, "r", encoding="utf-8") as f:
             state = json.load(f)
@@ -482,7 +457,6 @@ def main():
         todo = [canonicalize_url(u) for u in args.seeds]
         seen = set()
 
-    # Optional: seed from previous corpus
     if args.from_corpus and os.path.exists(args.from_corpus):
         seed_urls = []
         with open(args.from_corpus, "r", encoding="utf-8") as f:
@@ -494,8 +468,9 @@ def main():
                 seed_urls.append(rec.get("url", ""))
                 seed_urls.extend(rec.get("outlinks", []))
         for u in sorted(set(seed_urls)):
-            if u and u.startswith(ROOT) and is_article_like(u) and u not in seen:
-                todo.append(u)
+            u_norm = canonicalize_url(u)
+            if should_follow(u_norm) and u_norm not in seen:
+                todo.append(u_norm)
 
     rp = read_robots_txt(args.ignore_robots, ua=ua)
 
@@ -506,14 +481,14 @@ def main():
     try:
         while todo:
             url = todo.pop(0)
+            url = canonicalize_url(url)
             if url in seen:
                 continue
             seen.add(url)
 
-            if not url.startswith(ROOT):
+            if not should_follow(url):
                 continue
 
-            # Follow HTML pages; keep category pages to expand links
             if rp and not allowed_by_robots(rp, ua, url):
                 continue
 
@@ -531,12 +506,11 @@ def main():
             citation = extract_citation_text(soup)
             text_blocks = extract_text_blocks(soup)
             images = extract_images(url, soup)
-            tables = extract_tables(url, html_text)
+            tables = extract_tables(html_text)
             math_extracted = extract_equations_and_symbols(soup)
             equations = math_extracted["equations"]
             symbols = math_extracted["symbols"]
 
-            # Save tables to CSV
             table_meta = []
             for i, df in enumerate(tables):
                 base = f"{safe_filename(title) or 'page'}_{hashlib.sha1((url+str(i)).encode()).hexdigest()[:10]}.csv"
@@ -552,29 +526,25 @@ def main():
                 except Exception:
                     continue
 
-            # Download images
             image_meta = []
             for im in images:
-                local = download_image(im["src"], out_dir=img_dir, delay=max(args.delay/4.0, 0.0), ua=ua)
+                local = download_image(im["src"], out_dir=img_dir, delay=max(args.delay / 4.0, 0.0), ua=ua)
                 image_meta.append({
                     "src": im["src"],
                     "alt": im.get("alt", ""),
                     "local_path": os.path.relpath(local, out_root) if local else None
                 })
 
-            # Outlinks discovery
             outlinks = []
             for a in soup.find_all("a", href=True):
                 target = join_url(url, a["href"])
                 if not target:
                     continue
-                if not target.startswith(ROOT):
+                target = canonicalize_url(target)
+                if not should_follow(target):
                     continue
-                if EXCLUDE_PAT.search(target):
-                    continue
-                if target not in seen:
-                    if is_article_like(target):
-                        todo.append(target)
+                if target not in seen and target not in todo:
+                    todo.append(target)
                 outlinks.append(target)
 
             rec = PageRecord(
@@ -589,7 +559,7 @@ def main():
                 http_last_modified=last_mod,
                 http_etag=etag,
                 equations=equations,
-                symbols=symbols
+                symbols=symbols,
             )
             out_f.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
             out_f.flush()
@@ -598,11 +568,9 @@ def main():
             pbar.set_description(f"Crawled {pages_crawled} | todo={len(todo)}")
             pbar.update(1)
 
-            # Rate limit
             if args.delay > 0:
                 time.sleep(args.delay)
 
-            # Persist state periodically
             if pages_crawled % 25 == 0:
                 with open(state_path, "w", encoding="utf-8") as sf:
                     json.dump({"todo": todo, "seen": list(seen)}, sf, ensure_ascii=False, indent=2)
@@ -616,7 +584,6 @@ def main():
             json.dump({"todo": todo, "seen": list(seen)}, sf, ensure_ascii=False, indent=2)
         pbar.close()
 
-    # Chunking pass (optional)
     if args.chunk:
         with open(corpus_jsonl, "r", encoding="utf-8") as f_in, open(chunks_jsonl, "w", encoding="utf-8") as f_out:
             for line in f_in:
@@ -624,7 +591,7 @@ def main():
                 chunks = chunk_blocks(
                     rec.get("text_blocks", []),
                     max_words=args.chunk_max,
-                    overlap=args.chunk_overlap
+                    overlap=args.chunk_overlap,
                 )
                 for idx, ch in enumerate(chunks):
                     out = {
@@ -638,7 +605,7 @@ def main():
                         "tables": rec.get("tables", []),
                         "equations": rec.get("equations", []),
                         "symbols": rec.get("symbols", []),
-                        "crawl_ts": rec.get("crawl_ts", "")
+                        "crawl_ts": rec.get("crawl_ts", ""),
                     }
                     f_out.write(json.dumps(out, ensure_ascii=False) + "\n")
 

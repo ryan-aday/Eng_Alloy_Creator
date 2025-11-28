@@ -18,25 +18,26 @@ Engineering ToolBox Crawler & Ingestor (RAG-ready)
 USAGE EXAMPLES
 --------------
 # Minimal crawl (default seeds), polite delay:
-python mw_data_scraper.py --out ./mw_corpus
+python et_data_scraper.py --out ./et_corpus
 
 # Resume later:
-python mw_data_scraper.py --out ./mw_corpus --resume
+python et_data_scraper.py --out ./et_corpus --resume
 
 # Faster (only if you have permission), chunk for RAG:
-python mw_data_scraper.py --out ./mw_corpus --delay 0.25 --chunk
+python et_data_scraper.py --out ./et_corpus --delay 0.25 --chunk
 
 # Limit page count for testing:
-python mw_data_scraper.py --out ./mw_corpus --max-pages 100
+python et_data_scraper.py --out ./et_corpus --max-pages 100
 
 # Re-seed using URLs/outlinks from a prior run's corpus:
-python mw_data_scraper.py --out ./mw_corpus_v2 --from-corpus ./mw_corpus/corpus.jsonl --chunk
+python et_data_scraper.py --out ./et_corpus_v2 --from-corpus ./et_corpus/corpus.jsonl --chunk
 """
 
 import argparse
 import csv
 import hashlib
 import html
+import io
 import json
 import os
 import re
@@ -45,9 +46,10 @@ import time
 import urllib.parse
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from urllib import robotparser
 
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
@@ -55,16 +57,7 @@ from tqdm import tqdm
 # ------------------------
 # Constants & patterns
 # ------------------------
-START = "https://www.makeitfrom.com/"
-ORIGINAL_ROOT = "https://www.makeitfrom.com/"
-ARCHIVE_HOST = "https://web.archive.org"
-ARCHIVE_RE = re.compile(r"^(https?://web\.archive\.org/web/[^/]+/)(.*)$", re.IGNORECASE)
-# Some archived pages emit URLs that already include a nested `/web/<ts>/...` path inside the
-# MakeItFrom domain (e.g., https://www.makeitfrom.com/web/<ts>/https://www.makeitfrom.com/...).
-NESTED_ARCHIVE_IN_ORIGINAL = re.compile(
-    r"^(https?://www\.makeitfrom\.com)/web/\d+/(https?://www\.makeitfrom\.com/.*)$",
-    re.IGNORECASE,
-)
+ROOT = "https://www.makeitfrom.com"
 
 ARTICLE_PAT = re.compile(r"-[dt]_\d+\.html$", re.IGNORECASE)
 HTML_PAT = re.compile(r"\.html?$", re.IGNORECASE)
@@ -106,75 +99,26 @@ def canonicalize_url(url: str) -> str:
     u = u._replace(fragment="")
     return urllib.parse.urlunsplit(u)
 
-def _split_archive_url(url: str) -> Tuple[Optional[str], str]:
-    """Return (archive_prefix, original_url) for a web.archive.org URL.
-
-    If the URL is not an archive URL, archive_prefix is None and original_url is the input.
-    """
-    m = ARCHIVE_RE.match(url)
-    if not m:
-        return None, url
-    return m.group(1), m.group(2)
-
-def _wrap_archive(original_url: str, archive_prefix: Optional[str]) -> str:
-    if archive_prefix:
-        return f"{archive_prefix}{original_url}"
-    return original_url
-
-def _normalize_original(original_url: str) -> str:
-    """Strip nested Wayback paths accidentally embedded inside the original URL."""
-
-    m = NESTED_ARCHIVE_IN_ORIGINAL.match(original_url)
-    if m:
-        return canonicalize_url(m.group(2))
-    return canonicalize_url(original_url)
-
-def is_makeitfrom_url(url: str) -> bool:
-    """Return True if the URL points to the MakeItFrom domain (archived or live)."""
-    _, original = _split_archive_url(url)
-    normalized_original = _normalize_original(original)
-    return normalized_original.startswith(ORIGINAL_ROOT)
-
 def join_url(base: str, href: str) -> Optional[str]:
     if not href:
         return None
     href = href.strip()
-    if href.startswith("#"):
-        return None
     if href.startswith("//"):
         href = "https:" + href
-    if href.startswith("/web/"):
-        # Already an archive path; join directly against archive host to avoid double-wrapping.
-        href = urllib.parse.urljoin(ARCHIVE_HOST, href)
-
-    archive_prefix, base_original = _split_archive_url(base)
-
-    if href.startswith("http"):
-        href_archive_prefix, href_original = _split_archive_url(href)
-        if href_archive_prefix:
-            archive_prefix = href_archive_prefix
-            target_original = _normalize_original(href_original)
-        else:
-            target_original = _normalize_original(href)
-    else:
-        # Join relative URLs against the original (non-archive) location, then wrap back.
-        target_original = _normalize_original(urllib.parse.urljoin(base_original, href))
-
-    # Preserve archive prefix if we started from an archived page.
-    target = _wrap_archive(target_original, archive_prefix)
-    return canonicalize_url(target)
+    elif href.startswith("/"):
+        href = urllib.parse.urljoin(ROOT, href)
+    elif href.startswith("#"):
+        return None
+    elif not href.startswith("http"):
+        href = urllib.parse.urljoin(base, href)
+    return canonicalize_url(href)
 
 def is_article_like(url: str) -> bool:
-    _, original = _split_archive_url(url)
-    normalized_original = _normalize_original(original)
-    if not normalized_original.startswith(ORIGINAL_ROOT):
-        return False
-
     if EXCLUDE_PAT.search(url):
         return False
     if ARTICLE_PAT.search(url):
         return True
-    if HTML_PAT.search(original):
+    if url.startswith(ROOT) and HTML_PAT.search(url):
         return True
     return False
 
@@ -182,8 +126,7 @@ def read_robots_txt(ignore: bool, ua: str) -> Optional[robotparser.RobotFilePars
     if ignore:
         return None
     rp = robotparser.RobotFileParser()
-    robots_url = urllib.parse.urljoin(ORIGINAL_ROOT, "robots.txt")
-    rp.set_url(robots_url)
+    rp.set_url(urllib.parse.urljoin(ROOT, "/robots.txt"))
     try:
         rp.read()
         return rp
@@ -194,8 +137,7 @@ def allowed_by_robots(rp: Optional[robotparser.RobotFileParser], ua: str, url: s
     if rp is None:
         return True
     try:
-        _, original = _split_archive_url(url)
-        return rp.can_fetch(ua, _normalize_original(original))
+        return rp.can_fetch(ua, url)
     except Exception:
         return True
 
@@ -290,20 +232,12 @@ def extract_text_blocks(soup: BeautifulSoup) -> List[str]:
         prev = b
     return deduped
 
-def extract_tables(url: str, soup: BeautifulSoup) -> List[List[List[str]]]:
-    tables = []
-    for table in soup.find_all("table"):
-        rows = []
-        for tr in table.find_all("tr"):
-            cells = []
-            for cell in tr.find_all(["td", "th"]):
-                txt = _flatten_math_tags(cell).strip()
-                cells.append(txt)
-            if cells:
-                rows.append(cells)
-        if rows:
-            tables.append(rows)
-    return tables
+def extract_tables(url: str, html_text: str) -> List[pd.DataFrame]:
+    try:
+        dfs = pd.read_html(html_text)
+        return dfs
+    except Exception:
+        return []
 
 def extract_images(base_url: str, soup: BeautifulSoup) -> List[Dict]:
     out = []
@@ -454,7 +388,7 @@ def main():
     Engineering ToolBox full-site crawler & ingestor (RAG-ready)
     """
     parser = argparse.ArgumentParser(
-        prog="mw_data_scraper.py",
+        prog="et_data_scraper.py",
         formatter_class=argparse.RawTextHelpFormatter,
         description=(
             "Crawls EngineeringToolBox.com and saves pages, text, tables, images, equations, and symbol lists\n"
@@ -469,7 +403,7 @@ def main():
     # Required
     parser.add_argument(
         "--out", required=True,
-        help="Root output directory (JSONL + images + tables). Example: --out ./mw_corpus"
+        help="Root output directory (JSONL + images + tables). Example: --out ./et_corpus"
     )
 
     # General crawling controls
@@ -492,12 +426,10 @@ def main():
 
     # Crawl scope
     parser.add_argument(
-        "--start", default=START,
-        help="Archive start URL (timestamped Wayback link for MakeItFrom)."
-    )
-    parser.add_argument(
-        "--seeds", nargs="*", default=[],
-        help="Optional additional seed URLs (space-separated)."
+        "--seeds", nargs="*", default=[
+            ROOT,
+        ],
+        help="Seed URLs to start crawling from (space-separated)."
     )
     parser.add_argument(
         "--from-corpus",
@@ -545,11 +477,10 @@ def main():
         with open(state_path, "r", encoding="utf-8") as f:
             state = json.load(f)
         todo = state.get("todo", [])
-        seen_original = set(state.get("seen_original", state.get("seen", [])))
+        seen = set(state.get("seen", []))
     else:
-        all_seeds = [args.start] + list(args.seeds)
-        todo = [canonicalize_url(u) for u in all_seeds if u]
-        seen_original = set()
+        todo = [canonicalize_url(u) for u in args.seeds]
+        seen = set()
 
     # Optional: seed from previous corpus
     if args.from_corpus and os.path.exists(args.from_corpus):
@@ -563,15 +494,8 @@ def main():
                 seed_urls.append(rec.get("url", ""))
                 seed_urls.extend(rec.get("outlinks", []))
         for u in sorted(set(seed_urls)):
-            if not u:
-                continue
-            if not is_makeitfrom_url(u) or not is_article_like(u):
-                continue
-            _, u_original = _split_archive_url(u)
-            u_original_canon = _normalize_original(u_original)
-            if u_original_canon in seen_original:
-                continue
-            todo.append(u)
+            if u and u.startswith(ROOT) and is_article_like(u) and u not in seen:
+                todo.append(u)
 
     rp = read_robots_txt(args.ignore_robots, ua=ua)
 
@@ -582,13 +506,11 @@ def main():
     try:
         while todo:
             url = todo.pop(0)
-            _, queued_original = _split_archive_url(url)
-            queued_original_canon = _normalize_original(queued_original)
-
-            if queued_original_canon in seen_original:
+            if url in seen:
                 continue
+            seen.add(url)
 
-            if not is_makeitfrom_url(url):
+            if not url.startswith(ROOT):
                 continue
 
             # Follow HTML pages; keep category pages to expand links
@@ -599,14 +521,6 @@ def main():
             if r is None:
                 continue
 
-            resolved_url = canonicalize_url(r.url)
-            _, resolved_original = _split_archive_url(resolved_url)
-            resolved_original_canon = _normalize_original(resolved_original)
-
-            if resolved_original_canon in seen_original:
-                continue
-            seen_original.add(resolved_original_canon)
-
             last_mod = r.headers.get("Last-Modified")
             etag = r.headers.get("ETag")
 
@@ -616,30 +530,24 @@ def main():
             title = extract_title(soup)
             citation = extract_citation_text(soup)
             text_blocks = extract_text_blocks(soup)
-            images = extract_images(resolved_url, soup)
-            tables = extract_tables(resolved_url, soup)
+            images = extract_images(url, soup)
+            tables = extract_tables(url, html_text)
             math_extracted = extract_equations_and_symbols(soup)
             equations = math_extracted["equations"]
             symbols = math_extracted["symbols"]
 
             # Save tables to CSV
             table_meta = []
-            for i, rows in enumerate(tables):
-                if not rows:
-                    continue
-                n_rows = len(rows)
-                n_cols = max((len(r) for r in rows), default=0)
-                base = f"{safe_filename(title) or 'page'}_{hashlib.sha1((resolved_url+str(i)).encode()).hexdigest()[:10]}.csv"
+            for i, df in enumerate(tables):
+                base = f"{safe_filename(title) or 'page'}_{hashlib.sha1((url+str(i)).encode()).hexdigest()[:10]}.csv"
                 csv_path = os.path.join(tables_dir, base)
                 try:
-                    with open(csv_path, "w", encoding="utf-8", newline="") as f:
-                        writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
-                        writer.writerows(rows)
+                    df.to_csv(csv_path, index=False, quoting=csv.QUOTE_MINIMAL)
                     table_meta.append({
                         "csv_path": os.path.relpath(csv_path, out_root),
-                        "n_rows": int(n_rows),
-                        "n_cols": int(n_cols),
-                        "caption": "",
+                        "n_rows": int(df.shape[0]),
+                        "n_cols": int(df.shape[1]),
+                        "caption": ""
                     })
                 except Exception:
                     continue
@@ -657,21 +565,20 @@ def main():
             # Outlinks discovery
             outlinks = []
             for a in soup.find_all("a", href=True):
-                target = join_url(resolved_url, a["href"])
+                target = join_url(url, a["href"])
                 if not target:
                     continue
-                if not is_makeitfrom_url(target):
+                if not target.startswith(ROOT):
                     continue
-                _, t_original = _split_archive_url(target)
-                t_original_canon = _normalize_original(t_original)
                 if EXCLUDE_PAT.search(target):
                     continue
-                if t_original_canon not in seen_original and is_article_like(target):
-                    todo.append(target)
+                if target not in seen:
+                    if is_article_like(target):
+                        todo.append(target)
                 outlinks.append(target)
 
             rec = PageRecord(
-                url=resolved_url,
+                url=url,
                 title=title,
                 crawl_ts=now_iso(),
                 citation_text=citation,
@@ -698,7 +605,7 @@ def main():
             # Persist state periodically
             if pages_crawled % 25 == 0:
                 with open(state_path, "w", encoding="utf-8") as sf:
-                    json.dump({"todo": todo, "seen_original": list(seen_original)}, sf, ensure_ascii=False, indent=2)
+                    json.dump({"todo": todo, "seen": list(seen)}, sf, ensure_ascii=False, indent=2)
 
             if args.max_pages and pages_crawled >= args.max_pages:
                 break
@@ -706,7 +613,7 @@ def main():
     finally:
         out_f.close()
         with open(state_path, "w", encoding="utf-8") as sf:
-            json.dump({"todo": todo, "seen_original": list(seen_original)}, sf, ensure_ascii=False, indent=2)
+            json.dump({"todo": todo, "seen": list(seen)}, sf, ensure_ascii=False, indent=2)
         pbar.close()
 
     # Chunking pass (optional)
